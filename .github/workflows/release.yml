@@ -1,0 +1,72 @@
+name: Release
+# Pushing a tag such as v0.1.0 (matching Cargo.toml) builds static Linux
+# binaries and macOS binaries, tests them, and publishes a GitHub release
+# with checksums.txt, which install.sh downloads and verifies.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf,arm-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Install Zig
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - run: make test
+      - run: scripts/build-release.sh "$GITHUB_REF_NAME" linux
+      - name: Test Raspberry Pi binaries under emulation
+        run: sudo apt-get update && sudo apt-get install -y qemu-user && scripts/test-arm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/*.tar.gz
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: make test
+      - run: scripts/build-release.sh "$GITHUB_REF_NAME" darwin
+      - name: Smoke-test the native binary
+        run: |
+          tar -xzf dist/eggprobe_darwin_arm64.tar.gz -C "$RUNNER_TEMP" eggprobe
+          "$RUNNER_TEMP/eggprobe" --scan --subnet 127.0.0.1/32 --skip mdns --skip tailscale |
+            python3 -c 'import json,sys; assert json.load(sys.stdin)["complete"]'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin
+          path: dist/*.tar.gz
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: scripts/build-release.sh "$GITHUB_REF_NAME" checksums
+      - run: python3 scripts/test_installer.py
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "eggprobe $GITHUB_REF_NAME"
